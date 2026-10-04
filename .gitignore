@@ -1,0 +1,18 @@
+# Allowlist: only reviewed source files are tracked. Add new files deliberately.
+# (This doesn't affect files already committed or ZIP uploads.)
+/*
+!/.gitignore
+!/launcher.py
+!/lzo1x.py
+!/mkx_meshmod.py
+!/studio_core.py
+!/studio_gui.py
+!/studio_cli.py
+!/test_studio.py
+!/requirements.txt
+!/Launch Studio.cmd
+!/Setup Dependencies.cmd
+!/README.md
+!/CONTRIBUTING.md
+!/THIRD_PARTY.md
+!/LICENSE
