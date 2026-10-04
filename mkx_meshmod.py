@@ -1220,6 +1220,13 @@ def bc7_encode(rgba, _dedupe=True):
     return b''.join(out)
 
 
+def resize_channels(im, size, method):
+    """Resize each RGBA channel independently. Pillow premultiplies RGBA by alpha when resampling, which zeroes the
+    colour wherever alpha is 0; mask textures (Pmsk) store unrelated data in each channel, so that would destroy it."""
+    from PIL import Image
+    return Image.merge('RGBA', [band.resize(size, method) for band in im.split()])
+
+
 def image_mips(src, w, h, count):
     """Build `count` RGBA mip levels (numpy arrays) from a PIL image or solid colour, top level resized to w x h."""
     import numpy as np
@@ -1229,11 +1236,11 @@ def image_mips(src, w, h, count):
     else:
         base = src.convert('RGBA')
         if base.size != (w, h):
-            base = base.resize((w, h), Image.LANCZOS)
+            base = resize_channels(base, (w, h), Image.LANCZOS)
     mips = []
     for k in range(count):
         mw, mh = max(1, w >> k), max(1, h >> k)
-        im = base if k == 0 else base.resize((mw, mh), Image.BOX)
+        im = base if k == 0 else resize_channels(base, (mw, mh), Image.BOX)
         arr = np.asarray(im, dtype=np.uint8)
         if mw < 4 or mh < 4:                                 # pad tiny mips to one block
             arr = np.pad(arr, ((0, max(0, 4 - mh)), (0, max(0, 4 - mw)), (0, 0)), mode='edge')

@@ -94,6 +94,19 @@ class LzoTests(unittest.TestCase):
             lzo1x_decompress(bytes([17 + 5]) + b'hello' + b'\x11\x00\x00', 6)
 
 
+class TextureTests(unittest.TestCase):
+    """Synthetic images (no game data)."""
+
+    def test_mips_keep_colour_where_alpha_is_zero(self):
+        import numpy as np
+        from PIL import Image
+        import mkx_meshmod as mk
+        mask = Image.new('RGBA', (16, 16), (128, 0, 128, 0))   # Pmsk-style data: alpha 0 must not erase RGB
+        for mips in (mk.image_mips(mask, 16, 16, 5), mk.image_mips(mask, 8, 8, 4)):
+            for level in mips:
+                self.assertEqual({tuple(int(x) for x in v) for v in np.unique(level.reshape(-1, 4), axis=0)}, {(128, 0, 128, 0)})
+
+
 class LodTests(unittest.TestCase):
     """Synthetic one-triangle LOD (no game data)."""
 
