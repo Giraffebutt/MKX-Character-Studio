@@ -11,3 +11,5 @@ Keep this repository free of game content and other people's work:
 `.gitignore` is an allowlist, so add each new source file to it on purpose.
 
 Contributions are licensed under the same terms as the project ([PolyForm Noncommercial License 1.0.0](LICENSE)). Use, modification, and redistribution are permitted for noncommercial purposes, subject to the full license terms. Include the license terms or their URL and any required notices when redistributing.
+
+By submitting a contribution, you confirm that you have the right to submit it and that it does not contain copied game code, decompiler output, or third-party code incompatible with this project's license.

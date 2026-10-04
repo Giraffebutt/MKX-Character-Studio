@@ -4,8 +4,8 @@ LZO1X decompression in pure Python.
 Original MKX packages store their data in LZO1X-compressed blocks, so this decoder is required to read
 any unmodified game package (both for exporting and as a conversion template).
 
-The LZO1X format was created by Markus F.X.J. Oberhumer. This decoder was written for this project and is
-covered by this project's LICENSE.
+The LZO1X format was created by Markus F.X.J. Oberhumer. This project includes a Python implementation
+of LZO1X decompression used to read compatible package data.
 Only decompression is implemented; the tool writes ZLIB.
 """
 
