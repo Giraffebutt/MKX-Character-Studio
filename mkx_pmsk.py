@@ -125,6 +125,35 @@ class MaterialInfo:
                         values[p.name(*struct.unpack_from('<II', p.image, em['ParameterName'][5]))] = self._value(p, em['ParameterValue'])
         return values, parent
 
+    def param_guid(self, p, idx, name):
+        """ExpressionGUID of scalar parameter `name` as material `idx` sees it: from the nearest material instance that
+        sets it, or from the parameter expression in its base material."""
+        pkg, seen = p, set()
+        while idx and (id(pkg), idx) not in seen:
+            seen.add((id(pkg), idx))
+            if idx < 0:
+                path = pkg.objref(idx)
+                pkg = self.startup(); idx = self._index.get(path.lower(), 0)
+                continue
+            if pkg.classname(pkg.exports[idx - 1]['Class']) == 'Material':
+                pm = mk.prop_map(self._props(pkg, idx))
+                if 'Expressions' not in pm:
+                    return None
+                vo = pm['Expressions'][5]
+                for x in struct.unpack_from('<%di' % struct.unpack_from('<i', pkg.image, vo)[0], pkg.image, vo + 4):
+                    if x > 0:
+                        em = mk.prop_map(self._props(pkg, x))
+                        if ('ParameterName' in em and 'ExpressionGUID' in em and
+                                pkg.name(*struct.unpack_from('<II', pkg.image, em['ParameterName'][5])) == name):
+                            return bytes(pkg.image[em['ExpressionGUID'][5]:em['ExpressionGUID'][5] + 16])
+                return None
+            own = mk.material_scalars(pkg, idx)
+            if name in own:
+                return own[name][1]
+            pm = mk.prop_map(self._props(pkg, idx))
+            idx = struct.unpack_from('<i', pkg.image, pm['Parent'][5])[0] if 'Parent' in pm else 0
+        return None
+
     def resolve(self, p, idx):
         """(parameter values, base material name) of material `idx` in package `p`; the nearest setting wins."""
         key = (id(p), idx)

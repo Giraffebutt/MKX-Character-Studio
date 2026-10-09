@@ -671,6 +671,72 @@ def list_skeletal_meshes(p):
     return [p.objref(i + 1) for i, e in enumerate(p.exports) if p.classname(e['Class']) == 'SkeletalMesh']
 
 
+def material_scalars(p, idx):
+    """{parameter name: (value offset, ExpressionGUID bytes)} of a MaterialInstanceConstant's own ScalarParameterValues."""
+    e = p.exports[idx - 1]; d = p.image
+    props, _ = parse_props(p, d, e['SerialOffset'], e['SerialOffset'] + e['SerialSize'])
+    pm = prop_map(props); out = {}
+    if 'ScalarParameterValues' in pm:
+        _, _, _, size, _, vo = pm['ScalarParameterValues']; o = vo + 4
+        for _ in range(struct.unpack_from('<i', d, vo)[0]):
+            el, o = parse_props(p, d, o, vo + size)
+            em = prop_map(el)
+            if 'ParameterName' in em and 'ParameterValue' in em:
+                g = em.get('ExpressionGUID')
+                out[p.name(*struct.unpack_from('<II', d, em['ParameterName'][5]))] = (
+                    em['ParameterValue'][5], bytes(d[g[5]:g[5] + 16]) if g else bytes(16))
+    return out
+
+
+def set_material_scalars(p, idx, values, guids):
+    """Set scalar parameters on MaterialInstanceConstant export `idx`. Values it already overrides are changed in place;
+    inherited ones get a new ScalarParameterValues entry (same layout as the existing ones: ParameterName, ParameterValue,
+    ExpressionGUID) using guids[name], the GUID of that parameter in the material's base material. The parameter name
+    must already be in the package's name table. The export is rewritten at the end of the package when it grows."""
+    own = material_scalars(p, idx)
+    for name, value in values.items():
+        if name in own:
+            struct.pack_into('<f', p.image, own[name][0], float(value))
+    missing = [n for n in values if n not in own]
+    if not missing:
+        return
+    e = p.exports[idx - 1]; d = p.image; base, total = e['SerialOffset'], e['SerialSize']
+    props, _ = parse_props(p, d, base, base + total)
+    pm = prop_map(props)
+    if 'ScalarParameterValues' not in pm:
+        raise MKXError('%s has no scalar settings of its own to extend' % p.objref(idx))
+    _, _, _, size, _, vo = pm['ScalarParameterValues']
+    count = struct.unpack_from('<i', d, vo)[0]
+    if not count:
+        raise MKXError('%s has no scalar setting to copy the layout from' % p.objref(idx))
+    el, end = parse_props(p, d, vo + 4, vo + size)          # first entry: the layout every new entry copies
+    em = prop_map(el); first = bytes(d[vo + 4:end])
+    lower = {n.lower(): i for i, n in enumerate(p.names)}
+    extra = b''
+    for name in missing:
+        if name.lower() not in lower:
+            raise MKXError('%s cannot be added to %s (its name is not in this package)' % (name, p.objref(idx)))
+        if name not in guids:
+            raise MKXError('no base-material GUID for %s on %s' % (name, p.objref(idx)))
+        entry = bytearray(first)
+        struct.pack_into('<II', entry, em['ParameterName'][5] - (vo + 4), lower[name.lower()], 0)
+        struct.pack_into('<f', entry, em['ParameterValue'][5] - (vo + 4), float(values[name]))
+        if 'ExpressionGUID' in em:
+            g = em['ExpressionGUID'][5] - (vo + 4); entry[g:g + 16] = guids[name]
+        extra += bytes(entry)
+    blob = bytearray(d[base:base + total])
+    rel = vo - base
+    struct.pack_into('<i', blob, rel - 8, size + len(extra))            # ArrayProperty tag size
+    struct.pack_into('<i', blob, rel, count + len(missing))             # element count
+    blob[rel + size:rel + size] = extra                                 # new entries at the end of the array
+    p.append_export_data(idx, bytes(blob))
+    check = material_scalars(p, idx)
+    for name, value in values.items():
+        got = struct.unpack_from('<f', p.image, check[name][0])[0] if name in check else None
+        if got is None or abs(got - float(value)) > 1e-6:
+            raise MKXError('setting %s on %s did not verify' % (name, p.objref(idx)))
+
+
 def hide_skeletal_mesh(p, mesh):
     """Make SkeletalMesh `mesh` draw nothing, in place: every triangle index (draw, shadow and adjacency arrays) becomes
     vertex 0, so all triangles have zero area. Sizes and offsets stay the same, so nothing else in the package moves.

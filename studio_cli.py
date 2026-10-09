@@ -30,6 +30,10 @@ def main():
             s.add_argument('--extra', action='append', default=[], metavar='OBJECT=GLB',
                            help='also replace an extra object or other mesh with its own GLB; repeat for more. '
                                 '--texture-map may hold textures of every replaced mesh')
+            s.add_argument('--ao', action='append', default=[], metavar='DIFFUSE_TEXTURE=IMAGE',
+                           help='ambient occlusion image (relative to textures/) put into the alpha of that diffuse texture')
+            s.add_argument('--material-settings', metavar='JSON',
+                           help='JSON {material path: {PRIMARY_/ALTERNATE_ Roughness, Specularity, Metallic, Subsurface: 0-1}}')
         else:
             s.add_argument('--object', action='append', default=[], metavar='OBJECT',
                            help='also export an extra object (hat, weapon...); repeat for more. See the objects command')
@@ -59,14 +63,21 @@ def main():
                                                                        blend=not a.no_blend, blender=a.blender, objects=a.object)
         elif a.command == 'convert':
             mapping = json.loads(core.Path(a.texture_map).read_text(encoding='utf-8')) if a.texture_map else {}
-            parts, used = [], set()
+            ao = dict(x.split('=', 1) for x in a.ao)
+            settings = json.loads(core.Path(a.material_settings).read_text(encoding='utf-8')) if a.material_settings else {}
+            parts, used, used_mats = [], set(), set()
             for mesh, model in [(a.mesh, a.model)] + [x.split('=', 1) for x in a.extra]:
                 slots = {s['texture'] for s in core.job_texture_slots(a.workspace, a.game, a.package, mesh)['slots']}
-                parts.append(dict(mesh=mesh, model=model, textures={t: v for t, v in mapping.items() if t in slots}))
-                used |= slots
-            if set(mapping) - used:
-                raise core.mk.MKXError('--texture-map names textures that none of the replaced meshes use: %s'
-                                       % ', '.join(sorted(set(mapping) - used)))
+                mats = {m['material'] for m in core.job_material_settings(a.workspace, a.game, a.package, mesh)} if settings else set()
+                parts.append(dict(mesh=mesh, model=model, textures={t: v for t, v in mapping.items() if t in slots},
+                                  ao={t: v for t, v in ao.items() if t in slots},
+                                  materials={m: v for m, v in settings.items() if m in mats}))
+                used |= slots; used_mats |= mats
+            unused = (set(mapping) | set(ao)) - used
+            if unused:
+                raise core.mk.MKXError('these textures are not used by the replaced meshes: %s' % ', '.join(sorted(unused)))
+            if set(settings) - used_mats:
+                raise core.mk.MKXError('these materials are not used by the replaced meshes: %s' % ', '.join(sorted(set(settings) - used_mats)))
             result = core.job_convert_parts(a.workspace, a.game, a.package, parts,
                                       out_name=a.name, preview=not a.no_preview, uv2=a.uv2, darken=not a.no_darken, keep_size=a.keep_size, wrinkles_off=not a.keep_wrinkles,
                                       hide=a.hide)
