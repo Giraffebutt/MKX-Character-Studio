@@ -390,9 +390,10 @@ class LODModel:
     def parse(d, o, has_vertex_colors=False):
         r = Reader(d, o); L = LODModel(); L.start = o
         L.sections = [dict(mat=r.u16(), chunk=r.u16(), base=r.u32(), tris=r.u32(), sort=r.u8()) for _ in range(r.u32())]
-        n = r.u32(); L.indices = list(struct.unpack_from('<%dH' % n, d, r.o)); r.o += 2 * n
-        n = r.u32(); L.indices32 = list(struct.unpack_from('<%dI' % n, d, r.o)); r.o += 4 * n
-        n = r.u32(); r.o += 2 * n                                    # ShadowIndices
+        L.index_ranges = []                                          # (offset, bytes) of every triangle index array
+        n = r.u32(); L.indices = list(struct.unpack_from('<%dH' % n, d, r.o)); L.index_ranges.append((r.o, 2 * n)); r.o += 2 * n
+        n = r.u32(); L.indices32 = list(struct.unpack_from('<%dI' % n, d, r.o)); L.index_ranges.append((r.o, 4 * n)); r.o += 4 * n
+        n = r.u32(); L.index_ranges.append((r.o, 2 * n)); r.o += 2 * n  # ShadowIndices
         n = r.u32(); L.active_bones = list(struct.unpack_from('<%dH' % n, d, r.o)); r.o += 2 * n
         n = r.u32(); r.o += n                                        # ShadowTriangleDoubleSided
         L.chunks = []
@@ -430,8 +431,8 @@ class LODModel:
         else:
             L.dq = None
         n = r.u32(); r.o += n                                        # VertexBufferGPUMorphSkin
-        n = r.u32(); L.adjacency = list(struct.unpack_from('<%dH' % n, d, r.o)); r.o += 2 * n
-        n = r.u32(); L.adjacency32 = list(struct.unpack_from('<%dI' % n, d, r.o)); r.o += 4 * n
+        n = r.u32(); L.adjacency = list(struct.unpack_from('<%dH' % n, d, r.o)); L.index_ranges.append((r.o, 2 * n)); r.o += 2 * n
+        n = r.u32(); L.adjacency32 = list(struct.unpack_from('<%dI' % n, d, r.o)); L.index_ranges.append((r.o, 4 * n)); r.o += 4 * n
         # TriangleProbabilityDistribution: area-weighted triangle sampling as an alias table (empty on most meshes)
         n = r.u32(); L.prob = list(struct.unpack_from('<%df' % n, d, r.o)); r.o += 4 * n
         n = r.u32(); L.alias = list(struct.unpack_from('<%di' % n, d, r.o)); r.o += 4 * n
@@ -670,6 +671,16 @@ def list_skeletal_meshes(p):
     return [p.objref(i + 1) for i, e in enumerate(p.exports) if p.classname(e['Class']) == 'SkeletalMesh']
 
 
+def hide_skeletal_mesh(p, mesh):
+    """Make SkeletalMesh `mesh` draw nothing, in place: every triangle index (draw, shadow and adjacency arrays) becomes
+    vertex 0, so all triangles have zero area. Sizes and offsets stay the same, so nothing else in the package moves.
+    Returns the number of triangles hidden."""
+    m = SkeletalMesh(p, p.find_export(mesh, 'SkeletalMesh'))
+    for off, size in m.lod.index_ranges:
+        p.image[off:off + size] = bytes(size)
+    return m.lod.num_tris()
+
+
 def mic_texture_params(p, idx):
     """{parameter name: texture object index} from a MaterialInstanceConstant export's TextureParameterValues."""
     d = p.image; e = p.exports[idx - 1]
@@ -854,7 +865,123 @@ def material_slot(name, mats):
     return None
 
 
-IMPORT_DEFAULTS = dict(uv1='transfer', dq='transfer', default_slot=None, joint_tolerance=0.5, force=False, keep_bounds=False)
+def pack_uv2(prims, pad=0.004):
+    """A new second UV map like MKX's own: every UV island of every primitive gets its own spot, sized by its real
+    surface area, packed into the unit square without overlaps (the game paints blood and damage through it).
+    prims: [(positions, uv0, triangle indices)]; returns one [(u, v)] list per primitive."""
+    islands = []                                       # (prim, vertex list, 2D points, width, height)
+    for pi, (P, UV, idx) in enumerate(prims):
+        parent = list(range(len(P)))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]; x = parent[x]
+            return x
+        for k in range(0, len(idx), 3):
+            a, b, c = find(idx[k]), find(idx[k + 1]), find(idx[k + 2])
+            parent[b] = a; parent[find(c)] = a
+        groups = defaultdict(list)
+        for k in range(0, len(idx), 3):
+            groups[find(idx[k])].append(idx[k:k + 3])
+        for tris in groups.values():
+            area3 = area2 = 0.0
+            for t in tris:
+                p0, p1, p2 = (P[v] for v in t)
+                area3 += 0.5 * math.sqrt(sum(x * x for x in cross([p1[i] - p0[i] for i in range(3)], [p2[i] - p0[i] for i in range(3)])))
+                (u0, v0), (u1, v1), (u2, v2) = (UV[v][:2] for v in t)
+                area2 += 0.5 * abs((u1 - u0) * (v2 - v0) - (u2 - u0) * (v1 - v0))
+            verts = sorted({v for t in tris for v in t})
+            if area2 > 1e-12:
+                s = math.sqrt(area3 / area2) if area3 > 0 else 1.0
+                pts = {v: (UV[v][0] * s, UV[v][1] * s) for v in verts}
+            else:                                       # flat or missing UVs: project onto the island's main plane
+                ext = [max(P[v][i] for v in verts) - min(P[v][i] for v in verts) for i in range(3)]
+                ax = sorted(range(3), key=lambda i: -ext[i])[:2]
+                pts = {v: (P[v][ax[0]], P[v][ax[1]]) for v in verts}
+            us, vs = [q[0] for q in pts.values()], [q[1] for q in pts.values()]
+            pts = {v: (q[0] - min(us), q[1] - min(vs)) for v, q in pts.items()}
+            islands.append((pi, pts, max(max(us) - min(us), 1e-6), max(max(vs) - min(vs), 1e-6)))
+    order = sorted(range(len(islands)), key=lambda i: -islands[i][3])
+
+    def place(scale):                                  # shelf packing; None if it does not fit
+        x = y = row = 0.0; spots = {}
+        for i in order:
+            w, h = islands[i][2] * scale + 2 * pad, islands[i][3] * scale + 2 * pad
+            if w > 1:
+                return None
+            if x + w > 1:
+                x, y, row = 0.0, y + row, 0.0
+            if y + h > 1:
+                return None
+            spots[i] = (x + pad, y + pad); x += w; row = max(row, h)
+        return spots
+    lo, hi = 0.0, 1.0 / max(max(w, h) for _, _, w, h in islands)
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if place(mid) else (lo, mid)
+    spots = place(lo)
+    out = [[(0.0, 0.0)] * len(P) for P, _, _ in prims]
+    for i, (pi, pts, _, _) in enumerate(islands):
+        ox, oy = spots[i]
+        for v, (u, w) in pts.items():
+            out[pi][v] = (ox + u * lo, oy + w * lo)
+    return out
+
+
+def surface_normals(P, idx, merge=False):
+    """Per-vertex normal of the surface itself (area-weighted triangle normals, glTF counter-clockwise winding).
+    merge=True shares one normal between vertices at the same position, so UV seams stay smooth."""
+    key = (lambda v: tuple(round(c, 5) for c in P[v])) if merge else (lambda v: v)
+    acc = defaultdict(lambda: [0.0, 0.0, 0.0])
+    for f in range(0, len(idx), 3):
+        i0, i1, i2 = idx[f:f + 3]
+        fn = cross([P[i1][k] - P[i0][k] for k in range(3)], [P[i2][k] - P[i0][k] for k in range(3)])
+        for v in (i0, i1, i2):
+            s = acc[key(v)]
+            for k in range(3): s[k] += fn[k]
+    out = [None] * len(P)
+    for v in set(idx):
+        s = acc[key(v)]
+        out[v] = normalize(s) if dot(s, s) > 1e-24 else None
+    return out
+
+
+def check_normals(prims, good=0.5, fits=0.8):
+    """prims: [(P, N, idx)] of one mesh in glTF space. Shipped MKX meshes have vertex normals that follow the surface
+    (average agreement 0.96 on Erron Black), and the character shaders light, shade and reflect with them. A model whose
+    normals point elsewhere (for example written in a different axis frame than the positions) looks blotchy and shiny
+    in game. Returns (fixed N lists, message or None): normals that already follow the surface are kept; normals that
+    one axis turn or flip brings onto the surface are turned back (keeps hard edges); anything else is rebuilt from the
+    surface."""
+    import itertools
+    S = [surface_normals(P, idx) for P, N, idx in prims]
+    pairs = [(n, s) for (P, N, idx), Sp in zip(prims, S) for v, (n, s) in enumerate(zip(N, Sp)) if s is not None]
+    if not pairs:
+        return [N for _, N, _ in prims], None
+
+    def turn(R, n):
+        return tuple(R[r][0] * n[0] + R[r][1] * n[1] + R[r][2] * n[2] for r in range(3))
+
+    def score(R):
+        return sum(dot(normalize(turn(R, n)), s) for n, s in pairs) / len(pairs)
+    ident = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+    before = score(ident)
+    if before >= good:
+        return [N for _, N, _ in prims], None
+    turns = [tuple(tuple(sg[r] if c == perm[r] else 0 for c in range(3)) for r in range(3))
+             for perm in itertools.permutations(range(3)) for sg in itertools.product((1, -1), repeat=3)]
+    best = max(turns, key=score)
+    after = score(best)
+    if after >= fits:
+        return ([[turn(best, n) for n in N] for _, N, _ in prims],
+                'the model\'s vertex normals point the wrong way compared to its surface (%d%% match); turned them back '
+                '(%d%% match) so lighting and shine look right' % (round(max(before, 0) * 100), round(after * 100)))
+    rebuilt = [surface_normals(P, idx, merge=True) for P, N, idx in prims]
+    return ([[r if r is not None else n for r, n in zip(Rp, N)] for Rp, (_, N, _) in zip(rebuilt, prims)],
+            'the model\'s vertex normals do not follow its surface (%d%% match); rebuilt smooth normals from the surface'
+            % round(max(before, 0) * 100))
+
+
+IMPORT_DEFAULTS =dict(uv1='transfer', dq='transfer', default_slot=None, joint_tolerance=0.5, force=False, keep_bounds=False)
 
 
 def apply_mesh(p, mesh, model, log=print, **opts):
@@ -870,6 +997,19 @@ def apply_mesh(p, mesh, model, log=print, **opts):
     skinned = [i for i, nd in enumerate(j['nodes']) if 'mesh' in nd and 'skin' in nd]
     if not skinned:
         raise MKXError('no skinned mesh in %s (parent the mesh to the armature with an Armature modifier and export skinning)' % a.model)
+    # ---- second UV map (blood and damage): the model's own, a new packed one, or copied from the original
+    prim_list = [(ni, k, pr) for ni in skinned for k, pr in enumerate(j['meshes'][j['nodes'][ni]['mesh']]['primitives'])]
+    if a.uv1 == 'auto':
+        a.uv1 = 'model' if all('TEXCOORD_1' in pr['attributes'] for _, _, pr in prim_list) else 'generate'
+    generated = {}
+    if a.uv1 == 'generate':
+        packs = []
+        for _, _, pr in prim_list:
+            at = pr['attributes']; P = gl.accessor(at['POSITION'])
+            packs.append((P, gl.accessor(at['TEXCOORD_0']) if 'TEXCOORD_0' in at else [(0.0, 0.0)] * len(P),
+                          gl.accessor(pr['indices']) if 'indices' in pr else list(range(len(P)))))
+        generated = {(ni, k): uv for (ni, k, _), uv in zip(prim_list, pack_uv2(packs))}
+        log('made a new second UV map for blood and damage (every UV island packed without overlaps)')
     # ---- joint mapping + bind consistency
     gm_ref = [mat_mul(mat_mul(S_SWAP, sk.globals[b]), S_SWAP) for b in range(len(sk.names))]
     sections = defaultdict(lambda: dict(verts=[], tris=[]))
@@ -888,7 +1028,18 @@ def apply_mesh(p, mesh, model, log=print, **opts):
             ug = G[x]; rg = gm_ref[jb[k]]
             dist = math.sqrt(sum((ug[i][3] - rg[i][3]) ** 2 for i in range(3)))
             worst.append((dist, jn[k]))
-        for prim in j['meshes'][nd['mesh']]['primitives']:
+        node_prims = j['meshes'][nd['mesh']]['primitives']
+        fixed_normals, msg = [None] * len(node_prims), None
+        if all('NORMAL' in pr['attributes'] for pr in node_prims):
+            raw = []
+            for pr in node_prims:
+                Pn = gl.accessor(pr['attributes']['POSITION'])
+                raw.append((Pn, gl.accessor(pr['attributes']['NORMAL']),
+                            gl.accessor(pr['indices']) if 'indices' in pr else list(range(len(Pn)))))
+            fixed_normals, msg = check_normals(raw)
+            if msg:      # the exporter built the model's tangents around the wrong normals: rebuild them from the UVs
+                log(msg + '; rebuilt the tangents (normal map direction) from the UV map')
+        for pk, prim in enumerate(node_prims):
             if prim.get('mode', 4) != 4:
                 raise MKXError('only triangle primitives are supported')
             at = prim['attributes']
@@ -902,10 +1053,10 @@ def apply_mesh(p, mesh, model, log=print, **opts):
             if slot is None or not (0 <= slot < len(mats)):
                 raise MKXError('material %r does not map to a slot. Name materials "slotNN_..." (NN = 0..%d) or use --default-slot.\n  slots: %s'
                                  % (mname, len(mats) - 1, ', '.join('%d=%s' % (i, x.split('.')[-1]) for i, x in enumerate(mats))))
-            P = gl.accessor(at['POSITION']); N = gl.accessor(at['NORMAL']) if 'NORMAL' in at else None
-            T = gl.accessor(at['TANGENT']) if 'TANGENT' in at else None
+            P = gl.accessor(at['POSITION']); N = fixed_normals[pk]
+            T = gl.accessor(at['TANGENT']) if 'TANGENT' in at and not msg else None
             UV0 = gl.accessor(at['TEXCOORD_0']) if 'TEXCOORD_0' in at else [(0.0, 0.0)] * len(P)
-            UV1 = gl.accessor(at['TEXCOORD_1']) if 'TEXCOORD_1' in at else None
+            UV1 = generated[(ni, pk)] if generated else (gl.accessor(at['TEXCOORD_1']) if 'TEXCOORD_1' in at else None)
             infl = defaultdict(float)
             J0, W0 = gl.accessor(at['JOINTS_0']), gl.accessor(at['WEIGHTS_0'])
             J1 = gl.accessor(at['JOINTS_1']) if 'JOINTS_1' in at else None
@@ -1027,7 +1178,7 @@ def apply_mesh(p, mesh, model, log=print, **opts):
             geo['uv0'].append(vv['uv0'])
             k, dist = ref.nearest(pos)
             far = max(far, dist)
-            geo['uv1'].append(vv['uv1'] if (vv['uv1'] is not None and a.uv1 == 'model') else (OL.uv(k, 1) if a.uv1 == 'transfer' else vv['uv0']))
+            geo['uv1'].append(vv['uv1'] if (vv['uv1'] is not None and a.uv1 in ('model', 'generate')) else (OL.uv(k, 1) if a.uv1 == 'transfer' else vv['uv0']))
             if OL.dq is not None:
                 geo['dq'].append({'transfer': OL.dq[k], 'zero': 0.0, 'half': 0.5}[a.dq])
         geo['chunks'].append(dict(base=base_v, bonemap=bonemap, rigid=nrigid, soft=len(V) - nrigid,
@@ -1061,6 +1212,9 @@ def apply_mesh(p, mesh, model, log=print, **opts):
                % (len(geo['positions']), sum(c['rigid'] for c in geo['chunks']), len(geo['indices']) // 3, len(geo['sections']),
                   ','.join(str(s['mat']) for s in geo['sections']), len(actives), far))
     log(summary)
+    if a.uv1 == 'transfer' and far > 2.0:
+        log('WARNING: the second UV map (blood and damage) was copied from original vertices up to %.1f units away, so blood '
+            'will land in the wrong places. Let the converter make a new one instead.' % far)
     return summary
 
 
@@ -1248,7 +1402,53 @@ def image_mips(src, w, h, count):
     return mips
 
 
-def apply_image(p, texture, image, opaque=False, dds_out=None, log=print):
+def pow2_size(w, h, lo=4, hi=8192):
+    """Nearest power-of-two size (each side 4..8192), as game textures use for their mip chains."""
+    near = lambda x: min(hi, max(lo, 2 ** round(math.log2(max(x, 1)))))
+    return near(w), near(h)
+
+
+def rewrite_texture(p, ti, w, h, datas):
+    """Store new BC7 mips (largest first, w x h) for Texture2D export `ti`, changing its size: the export is rebuilt
+    with SizeX/SizeY/MipTailBaseIdx updated and every mip stored inline, then appended to the package."""
+    d = p.image; e = p.exports[ti - 1]; base, end = e['SerialOffset'], e['SerialOffset'] + e['SerialSize']
+    props, pend = parse_props(p, d, base, end)
+    blob = bytearray(d[base:pend]); pm = prop_map(props)
+    for name, value in (('SizeX', w), ('SizeY', h), ('MipTailBaseIdx', len(datas) - 1)):
+        if name in pm:
+            struct.pack_into('<i', blob, pm[name][5] - base, value)
+    r = Reader(d, pend); pre = []
+    for _ in range(2):
+        fl, cnt, sz, off = r.u32(), r.u32(), r.u64(), r.u64()
+        payload = None
+        if not fl & 1:
+            payload = bytes(d[r.o:r.o + sz]); r.o += sz
+        pre.append((fl, cnt, sz, off, payload))
+    mid = [r.u32(), r.u32()]; n = r.u32(); arr = bytes(d[r.o:r.o + 4 * n]); r.o += 4 * n
+    for _ in range(r.u32()):
+        fl, cnt, sz, off = r.u32(), r.u32(), r.u64(), r.u64()
+        if not fl & 1: r.o += sz
+        r.u32(); r.u32()
+    tail = bytes(d[r.o:end])
+    new_off = len(d)
+    out = Writer(); out.raw(bytes(blob))
+    for fl, cnt, sz, off, payload in pre:
+        out.u32(fl); out.u32(cnt)
+        if payload is None:
+            out.u64(sz); out.u64(off)
+        else:
+            out.u64(len(payload)); out.u64(new_off + len(out) + 8); out.raw(payload)
+    out.u32(mid[0]); out.u32(mid[1]); out.u32(n); out.raw(arr)
+    out.u32(len(datas))
+    for k, data in enumerate(datas):
+        out.u32(0); out.u32(len(data)); out.u64(len(data)); out.u64(new_off + len(out) + 8); out.raw(data)
+        out.u32(max(1, w >> k)); out.u32(max(1, h >> k))
+    out.raw(tail)
+    p.append_export_data(ti, bytes(out.b))
+    p.image[base:end] = bytes(end - base)          # the old data is no longer referenced; zeros compress to almost nothing
+
+
+def apply_image(p, texture, image, opaque=False, dds_out=None, log=print, keep_size=False):
     """Resize `image` (path to PNG/TGA/JPG/..., a PIL image, or 'solid:R,G,B,A') to the texture's size, build its mip
     chain, BC7-encode it and write it over the inline Texture2D `texture` in the loaded package (in memory)."""
     ti = p.find_export(texture, 'Texture2D'); t = read_texture(p, ti)
@@ -1269,6 +1469,21 @@ def apply_image(p, texture, image, opaque=False, dds_out=None, log=print):
             raise MKXError('use solid:R,G,B,A')
     else:
         src = Image.open(image) if isinstance(image, str) else image
+        if keep_size and src.size != (w, h):                    # experimental: the texture takes the image's size
+            nw, nh = pow2_size(*src.size)
+            count = int(math.log2(min(nw, nh))) - 1             # down to a 4-pixel side, as the game's textures do
+            if (nw, nh) != src.size:
+                log('keeping %s near its own size: %dx%d -> %dx%d (textures need power-of-two sides)'
+                    % (os.path.basename(label), src.size[0], src.size[1], nw, nh))
+            if opaque:
+                src = src.convert('RGBA'); src.putalpha(255)
+            datas = [bc7_encode(arr) for arr in image_mips(src, nw, nh, count)]
+            rewrite_texture(p, ti, nw, nh, datas)
+            if dds_out:
+                open(dds_out, 'wb').write(dds_bytes(nw, nh, datas, t['srgb']))
+            log('encoded %s -> %s at its own size (%dx%d, %d mips, BC7; original was %dx%d) [experimental]'
+                % (os.path.basename(label), texture, nw, nh, count, w, h))
+            return
         if src.size != (w, h):
             log('resizing %s %dx%d -> %dx%d' % (os.path.basename(label), src.size[0], src.size[1], w, h))
         if opaque:
@@ -1342,7 +1557,7 @@ def main():
     s.set_defaults(f=cmd_export_ref)
     s = sp.add_parser('export-textures'); s.add_argument('package'); s.add_argument('outdir'); s.set_defaults(f=cmd_export_textures)
     s = sp.add_parser('import-mesh'); s.add_argument('package'); s.add_argument('mesh'); s.add_argument('model'); s.add_argument('out')
-    s.add_argument('--uv1', choices=['transfer', 'model', 'uv0'], default='transfer',
+    s.add_argument('--uv1', choices=['transfer', 'model', 'uv0', 'generate', 'auto'], default='transfer',
                    help='second UV set: copy from nearest original vertex (default), use the model\'s TEXCOORD_1, or duplicate UV0')
     s.add_argument('--dq', choices=['transfer', 'zero', 'half'], default='transfer',
                    help='dual-quaternion blend weight per vertex: nearest original vertex (default), 0 (linear) or 0.5')

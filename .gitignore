@@ -5,6 +5,8 @@
 !/launcher.py
 !/lzo1x.py
 !/mkx_meshmod.py
+!/blender_rig.py
+!/mkx_pmsk.py
 !/studio_core.py
 !/studio_gui.py
 !/studio_cli.py
