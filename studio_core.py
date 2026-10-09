@@ -196,6 +196,70 @@ def job_texture_slots(ws, game_dir, pkg_name, mesh, log=print):
     return dict(slots=mk.mesh_texture_slots(p, mesh), materials=[x.split('.')[-1] for x in m.materials()])
 
 
+# ----------------------------------------------------------------------------------------------- material settings
+# MKX has no roughness, specular or metalness textures: each material holds two sets of these numbers and the Pmsk
+# alpha blends between them per pixel (black = set 1, white = set 2). These are the numbers the editor changes.
+MATERIAL_SETTINGS = [('Roughness', 'Roughness'), ('Specularity', 'Shine'), ('Metallic', 'Metalness'), ('Subsurface', 'Subsurface')]
+MATERIAL_SETS = [('PRIMARY', 'Set 1 (Pmsk alpha black)'), ('ALTERNATE', 'Set 2 (Pmsk alpha white)')]
+MATERIAL_PARAMS = ['%s_%s' % (s, k) for s, _ in MATERIAL_SETS for k, _ in MATERIAL_SETTINGS]
+
+
+def _material_info(game_dir):
+    import mkx_pmsk as pm
+    return pm.MaterialInfo(str(Path(game_dir) / 'Asset' / 'Startup.xxx') if game_dir else '')
+
+
+def related_materials(p, idx):
+    """The material and its copies that should follow it: same-named instances (the cinematic HQ copy) and the
+    alternate-palette (_AP) versions."""
+    import mkx_pmsk as pm
+    name = p.exports[idx - 1]['ObjectName']
+    names = {name.lower(), pm.alt_palette_name(name).lower()}
+    return [i + 1 for i, e in enumerate(p.exports)
+            if e['ObjectName'].lower() in names and p.classname(e['Class']) == 'MaterialInstanceConstant']
+
+
+def job_material_settings(ws, game_dir, pkg_name, mesh, log=print):
+    """[{material, name, base, values}] for the materials of `mesh` that can be edited (instances in its package);
+    values holds the current numbers of MATERIAL_PARAMS that the material has."""
+    p = mk.load(template_path(ws, game_dir, mesh_homes(ws, game_dir, pkg_name, mesh, log)[0], log))
+    info = _material_info(game_dir)
+    m = mk.SkeletalMesh(p, p.find_export(mesh, 'SkeletalMesh'))
+    out, seen = [], set()
+    for path in m.materials():
+        if not path or path == 'None' or path.lower() in seen:
+            continue
+        seen.add(path.lower())
+        try:
+            idx = p.find_export(path, 'MaterialInstanceConstant')
+        except KeyError:
+            continue
+        values, base = info.resolve(p, idx)
+        values = {k: round(float(values[k]), 4) for k in MATERIAL_PARAMS if k in values and not isinstance(values[k], (tuple, str))}
+        if values:
+            out.append(dict(material=path, name=path.split('.')[-1], base=base, values=values))
+    return out
+
+
+def apply_material_settings(p, materials, game_dir, report):
+    """materials: {material path: {parameter: value}} -> set on each material (and its related copies) in `p`."""
+    info = _material_info(game_dir)
+    for path, values in materials.items():
+        values = {k: float(v) for k, v in values.items() if k in MATERIAL_PARAMS}
+        bad = [k for k, v in values.items() if not 0.0 <= v <= 1.0]
+        if bad:
+            raise mk.MKXError('Material settings must be between 0 and 1 (%s on %s).' % (', '.join(bad), path.split('.')[-1]))
+        try:
+            idx = p.find_export(path, 'MaterialInstanceConstant')
+        except KeyError:
+            raise mk.MKXError('Material %s was not found.' % path)
+        for target in related_materials(p, idx):
+            guids = {k: info.param_guid(p, target, k) for k in values}
+            mk.set_material_scalars(p, target, values, {k: g for k, g in guids.items() if g})
+            report('material settings: %s  %s' % (p.objref(target).split('.')[-1],
+                                                    ', '.join('%s %.3g' % (k, v) for k, v in sorted(values.items()))))
+
+
 # ----------------------------------------------------------------------------------------------- extra objects
 # Hats, weapons and other props are separate SkeletalMeshes that the game spawns and attaches to the character. They
 # are not in CHAR_<name>_<costume>.xxx but in the script-asset packages (same naming for the whole cast):
@@ -546,14 +610,22 @@ UV2_CHOICES = {'auto': "Your model's 2nd UV map, or make one if it has none",
                'transfer': 'Copy from the original character (only for edits of the original mesh)'}
 
 
-def prepare_diffuse(image, darken=True, log=print):
-    """A diffuse image ready for MKX: its own alpha kept as shading if it has one, otherwise DIFFUSE_SHADING; colours
-    darkened to BRIGHT_TARGET when they are much brighter than MKX textures (and `darken` is on)."""
+def prepare_diffuse(image, darken=True, log=print, ao=None):
+    """A diffuse image ready for MKX: alpha is shading (ambient occlusion). An `ao` image (white = open, dark = creases)
+    becomes the alpha; otherwise the image's own alpha is kept if it has one, else DIFFUSE_SHADING. Colours are darkened
+    to BRIGHT_TARGET when they are much brighter than MKX textures (and `darken` is on)."""
     import numpy as np
     from PIL import Image
     im = Image.open(image) if isinstance(image, (str, Path)) else image
     px = np.asarray(im.convert('RGBA')).astype(np.float64)
-    if px[..., 3].min() >= 250:
+    if ao is not None:
+        occ = Image.open(ao) if isinstance(ao, (str, Path)) else ao
+        occ = occ.convert('L')
+        if occ.size != im.size:
+            occ = occ.resize(im.size, Image.LANCZOS)
+        px[..., 3] = np.asarray(occ, dtype=np.float64)
+        log('ambient occlusion map put into the diffuse alpha (average %.0f; MKX characters average about 174-209)' % px[..., 3].mean())
+    elif px[..., 3].min() >= 250:
         px[..., 3] = DIFFUSE_SHADING
         log("diffuse has no alpha of its own: shading (alpha) set to %d, the middle of MKX's own shading maps" % DIFFUSE_SHADING)
     mean = px[..., :3].mean()
@@ -583,25 +655,31 @@ def job_convert(ws, game_dir, pkg_name, mesh, model_file, tex_choice, extra_part
 
 def job_convert_parts(ws, game_dir, pkg_name, parts, uv2='auto', darken=True, keep_size=False, wrinkles_off=True,
                       force=False, preview=True, out_name=None, hide=(), log=print):
-    """Replace every mesh in `parts` ([{mesh, model, textures: {texture: image}}]) with its own .glb and hide the
-    objects in `hide`, in the character package and in every other package that holds them. Writes only the packages
-    that changed into one result folder."""
+    """Change every mesh in `parts`, in the character package and in every other package that holds it, and hide the
+    objects in `hide`. A part is {mesh, model, textures: {texture: image}, ao: {diffuse texture: image},
+    materials: {material: {setting: value}}}; model may be empty to keep the original mesh and only change its
+    textures or material settings. Writes only the packages that changed into one result folder."""
     setup_workspace(ws, game_dir)
     hide = sorted(set(hide or ()))
+    parts = [pt for pt in parts if pt.get('model') or pt.get('materials') or any((pt.get('ao') or {}).values())
+             or any(v and v != KEEP for v in (pt.get('textures') or {}).values())]
     if not parts and not hide:
-        raise mk.MKXError('Link a .glb to at least one mesh first (or untick an object to hide).')
+        raise mk.MKXError('Link a .glb to at least one mesh first (or change a texture or setting, or untick an object to hide).')
     models, seen = {}, set()
     for part in parts:
+        if part['mesh'].lower() in seen:
+            raise mk.MKXError('%s is listed twice.' % part['mesh'])
+        seen.add(part['mesh'].lower())
+        if not part.get('model'):
+            continue
         model = child(child(ws, 'character'), part['model'])
         if model.suffix.lower() != '.glb' or not model.is_file():
             raise mk.MKXError('Import a rigged GLB first (%s).' % part['model'])
-        if part['mesh'].lower() in seen:
-            raise mk.MKXError('%s has two models linked to it.' % part['mesh'])
-        seen.add(part['mesh'].lower()); models[part['mesh']] = model
-    both = [h for h in hide if h.lower() in seen]
+        models[part['mesh']] = model
+    both = [h for h in hide if h.lower() in {m.lower() for m in models}]
     if both:
         raise mk.MKXError('These objects are set to be replaced and hidden; keep one: %s' % ', '.join(both))
-    name = safe_name(out_name or (models[parts[0]['mesh']].stem if parts else Path(pkg_name).stem))
+    name = safe_name(out_name or (next(iter(models.values())).stem if models else Path(pkg_name).stem))
     lines = []
 
     def report(message):
@@ -619,33 +697,45 @@ def job_convert_parts(ws, game_dir, pkg_name, parts, uv2='auto', darken=True, ke
     main_mesh = default_mesh(mk.list_skeletal_meshes(main), pkg_name)
     homes = {}
     for part in parts:
-        mesh, tex_choice = part['mesh'], part.get('textures') or {}
+        mesh, tex_choice, ao = part['mesh'], part.get('textures') or {}, part.get('ao') or {}
         homes[mesh] = mesh_homes(ws, game_dir, pkg_name, mesh, report)
+        for tex, image in ao.items():
+            source = tex_choice.get(tex)
+            if image and (not source or source == KEEP or source in SOLIDS or source.lower().endswith('.dds')):
+                raise mk.MKXError('An ambient occlusion map goes into the alpha of your diffuse image: pick a PNG/TGA/JPG '
+                                  'diffuse for %s first.' % tex.split('.')[-1])
         for n, home in enumerate(homes[mesh]):
             p = load(home)
             slots = {s['texture']: s for s in mk.mesh_texture_slots(p, mesh)}
             for tex, source in tex_choice.items():
                 if n == 0 and source and source != KEEP and (tex not in slots or not slots[tex]['replaceable']):
                     raise mk.MKXError('Texture cannot be replaced: %s' % tex)
-            report('Base: %s / %s; model: %s' % (home, mesh, part['model']))
-            mk.apply_mesh(p, mesh, str(models[mesh]), log=report, uv1=uv2, force=force)
+            if mesh in models:
+                report('Base: %s / %s; model: %s' % (home, mesh, part['model']))
+                mk.apply_mesh(p, mesh, str(models[mesh]), log=report, uv1=uv2, force=force)
+            else:
+                report('Base: %s / %s; original mesh kept' % (home, mesh))
             touched(home)
             for tex, source in tex_choice.items():
                 if not source or source == KEEP or tex not in slots or not slots[tex]['replaceable']:
                     continue
+                key = (source, ao.get(tex) or '')
                 if (home, tex) in applied:                      # a texture shared by two replaced meshes
-                    if applied[home, tex] != source:
+                    if applied[home, tex] != key:
                         raise mk.MKXError('%s is shared by two meshes, but they have different images (%s, %s). '
-                                          'Use one image for both.' % (tex.split('.')[-1], applied[home, tex], source))
+                                          'Use one image for both.' % (tex.split('.')[-1], applied[home, tex][0], source))
                     continue
-                applied[home, tex] = source
+                applied[home, tex] = key
                 image = SOLIDS.get(source) or str(child(child(ws, 'textures'), source))
                 if image.lower().endswith('.dds'):
                     apply_dds(p, tex, image, report)
                 else:
                     if slots[tex]['param'] == 'DiffuseMap' and not image.startswith('solid:'):
-                        image = prepare_diffuse(image, darken, report)
+                        occlusion = str(child(child(ws, 'textures'), ao[tex])) if ao.get(tex) else None
+                        image = prepare_diffuse(image, darken, report, ao=occlusion)
                     mk.apply_image(p, tex, image, log=report, keep_size=keep_size)
+            if part.get('materials'):
+                apply_material_settings(p, part['materials'], game_dir, report)
     if wrinkles_off and main_mesh in models:
         # The original character's face-wrinkle zones are painted for its own face layout; on a new model they put
         # the original's wrinkle bumps in random places during intros and close-ups. Black masks turn them off.
@@ -683,13 +773,16 @@ def job_convert_parts(ws, game_dir, pkg_name, parts, uv2='auto', darken=True, ke
         if preview:
             for part in parts:
                 mesh = part['mesh']
+                if mesh not in models:
+                    continue
                 stem = name if mesh == main_mesh else '%s_%s' % (name, safe_name(mesh.split('.')[-1]))
                 mk.export_ref(saved[homes[mesh][0]], mesh, str(stage / (stem + '_preview.glb')), embed_textures=True, log=report)
         if len(changed) > 1 or changed[0] != pkg_name:
             report("Copy every .xxx file in this folder into the game's Asset folder (keep backups of the originals).")
         metadata = {'character': pkg_name, 'created': datetime.datetime.now().astimezone().isoformat(),
-                    'parts': [dict(mesh=pt['mesh'], model=pt['model'], model_sha256=sha256(models[pt['mesh']]),
-                                   textures=pt.get('textures') or {}, packages=homes[pt['mesh']]) for pt in parts],
+                    'parts': [dict(mesh=pt['mesh'], model=pt['model'], model_sha256=sha256(models[pt['mesh']]) if pt['mesh'] in models else None,
+                                   textures=pt.get('textures') or {}, ao=pt.get('ao') or {}, materials=pt.get('materials') or {},
+                                   packages=homes[pt['mesh']]) for pt in parts],
                     'hidden_objects': hide,
                     'packages': {h: dict(template_sha256=sha256(template_path(ws, game_dir, h, lambda m: None)),
                                          output_sha256=sha256(stage / h)) for h in changed},

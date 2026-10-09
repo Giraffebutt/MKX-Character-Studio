@@ -17,6 +17,7 @@ import mkx_meshmod as mk  # noqa: E402
 from studio_core import *
 SETTINGS_FILE = os.path.join(HERE, 'studio_settings.json')
 NO_MODEL = '(none)'
+NO_AO = '(none: keep the diffuse alpha)'
 ABOUT_TITLE = 'Unofficial Modding Tool'
 ABOUT_TEXT = ('MKX Character Studio is an independent community project and is not affiliated with or endorsed by '
               'Warner Bros. Games or NetherRealm Studios. No Mortal Kombat X game assets are distributed with this '
@@ -147,7 +148,7 @@ def run_gui(selftest=False):
             self.btn(f, 'Import GLB...', self.import_glb).grid(row=1, column=3, sticky='w', **pad)
             self.c_summary = ttk.Label(f, text='', wraplength=1040)
             self.c_summary.grid(row=2, column=0, columnspan=4, sticky='w', padx=8)
-            self.c_paths, self.c_default, self.cur_mesh = {}, '', None
+            self.c_paths, self.c_default, self.cur_mesh, self.ao_rows = {}, '', None, {}
 
             texture_panel = ttk.LabelFrame(f, text='Textures (choose what replaces each original texture)')
             texture_panel.grid(row=3, column=0, columnspan=4, sticky='nsew', **pad)
@@ -184,6 +185,7 @@ def run_gui(selftest=False):
             self.c_out = tk.StringVar(); ttk.Entry(row, textvariable=self.c_out, width=30).pack(side='left', padx=6)
             self.btn(row, 'Convert to Mortal Kombat X format', self.do_convert).pack(side='left', padx=6)
             self.btn(row, 'Import textures...', self.import_textures).pack(side='left', padx=6)
+            self.btn(row, 'Material settings...', self.edit_materials).pack(side='left', padx=6)
             self.btn(row, 'Open converted folder', lambda: self.open_dir(os.path.join(self.ws.get(), 'converted'))).pack(side='left', padx=6)
             f.columnconfigure(1, weight=1); f.rowconfigure(3, weight=1)
 
@@ -405,7 +407,7 @@ def run_gui(selftest=False):
             for var in (self.e_pkg, self.e_mesh, self.c_pkg, self.c_mesh, self.x_pkg, self.x_mesh): var.set('')
             self.e_mesh_cb['values'] = []; self.c_mesh_cb['values'] = []; self.x_mesh_cb['values'] = []
             for w in self.texframe.winfo_children(): w.destroy()
-            self.tex_rows = {}; self.cur_mesh = None; self.c_paths = {}
+            self.tex_rows, self.ao_rows = {}, {}; self.cur_mesh = None; self.c_paths = {}
             self.show_objects(note='Pick a base character first.')
             self.e_obj_vars = self.fill_checks(self.e_objframe, note='Pick a character package first.')
             self.update_summary()
@@ -428,6 +430,8 @@ def run_gui(selftest=False):
             self.images = list_images(self.ws.get())
             for tex, (cb, var, slot) in self.tex_rows.items():
                 cb['values'] = self.row_values(slot)
+            for tex, (cb, var) in getattr(self, 'ao_rows', {}).items():
+                cb['values'] = [NO_AO] + list(self.images)
             self.auto_textures(only_unchosen=True)     # new images fill textures still on "keep original"
             self.save_current()
 
@@ -462,8 +466,11 @@ def run_gui(selftest=False):
             st = self.choices()
             if self.cur_mesh:
                 model = self.c_model.get()
+                old = st['meshes'].get(self.cur_mesh, {})
                 st['meshes'][self.cur_mesh] = dict(model='' if model in ('', NO_MODEL) else model,
-                                                   textures={t: v.get() for t, (cb, v, s) in self.tex_rows.items() if v.get() != KEEP})
+                                                   textures={t: v.get() for t, (cb, v, s) in self.tex_rows.items() if v.get() != KEEP},
+                                                   ao={t: v.get() for t, (cb, v) in self.ao_rows.items() if v.get() != NO_AO},
+                                                   materials=old.get('materials', {}))
                 st['current'] = self.cur_mesh
             if self.obj_vars:
                 st['hidden'] = [p for p, v in self.obj_vars.items() if not v.get()]
@@ -474,7 +481,9 @@ def run_gui(selftest=False):
                 self.c_summary.configure(text=''); return
             names = {p: lbl for lbl, p in self.c_paths.items()}
             st = self.choices()
-            linked = ['%s  <-  %s' % (names[p], m['model']) for p, m in st['meshes'].items() if m.get('model') and p in names]
+            linked = ['%s  <-  %s' % (names[p], m['model'] or 'original mesh, %s' % ' + '.join(
+                          w for w, on in (('new textures', m.get('textures')), ('AO map', m.get('ao')), ('material settings', m.get('materials'))) if on))
+                      for p, m in st['meshes'].items() if p in names and (m.get('model') or m.get('textures') or m.get('ao') or m.get('materials'))]
             hidden = [names.get(p, p.split('.')[-1]) for p in st['hidden']]
             text = ('Will be converted:  ' + ';   '.join(linked)) if linked else 'No .glb linked yet: pick a mesh to replace, then the .glb that replaces it.'
             if hidden:
@@ -487,7 +496,7 @@ def run_gui(selftest=False):
                 return
             self.cur_mesh = None; self.c_paths = {}; self.c_mesh.set(''); self.c_mesh_cb['values'] = []
             for w in self.texframe.winfo_children(): w.destroy()
-            self.tex_rows = {}
+            self.tex_rows, self.ao_rows = {}, {}
             self.show_objects(note='Looking for extra objects...'); self.update_summary()
 
             def done(r):
@@ -512,21 +521,31 @@ def run_gui(selftest=False):
             def done(r):
                 for w in self.texframe.winfo_children():
                     w.destroy()
-                self.tex_rows = {}
+                self.tex_rows, self.ao_rows = {}, {}
                 ttk.Label(self.texframe, text='Material slots: ' + ', '.join('%d=%s' % (i, m) for i, m in enumerate(r['materials'])),
                           wraplength=900).grid(row=0, column=0, columnspan=2, sticky='w', padx=6, pady=3)
                 if not r['slots']:
                     ttk.Label(self.texframe, text='This mesh has no textures that can be replaced here.').grid(row=1, column=0, sticky='w', padx=6)
-                for i, s in enumerate(r['slots']):
+                row = 1
+                for s in r['slots']:
                     label = '%s  -  %s  (%dx%d, slots %s)' % (ROLE_NAMES.get(s['param'], s['param']), s['texture'].split('.')[-1],
                                                              s['size'][0], s['size'][1], ','.join(map(str, s['slots'])))
-                    ttk.Label(self.texframe, text=label, wraplength=510).grid(row=i + 1, column=0, sticky='w', padx=6, pady=2)
+                    ttk.Label(self.texframe, text=label, wraplength=510).grid(row=row, column=0, sticky='w', padx=6, pady=2)
                     var = tk.StringVar(value=KEEP)
                     cb = ttk.Combobox(self.texframe, textvariable=var, state='readonly' if s['replaceable'] else 'disabled', width=46,
                                       values=self.row_values(s))
-                    cb.grid(row=i + 1, column=1, sticky='w', padx=6, pady=2)
+                    cb.grid(row=row, column=1, sticky='w', padx=6, pady=2)
                     cb.bind('<<ComboboxSelected>>', lambda e: self.save_current())
-                    self.tex_rows[s['texture']] = (cb, var, s)
+                    self.tex_rows[s['texture']] = (cb, var, s); row += 1
+                    if s['param'] == 'DiffuseMap' and s['replaceable']:      # its ambient occlusion goes into its alpha
+                        ttk.Label(self.texframe, text='      Ambient occlusion for it (goes into its alpha; white = open, dark = creases)',
+                                  wraplength=510).grid(row=row, column=0, sticky='w', padx=6, pady=2)
+                        var = tk.StringVar(value=NO_AO)
+                        cb = ttk.Combobox(self.texframe, textvariable=var, state='readonly', width=46,
+                                          values=[NO_AO] + list(getattr(self, 'images', [])))
+                        cb.grid(row=row, column=1, sticky='w', padx=6, pady=2)
+                        cb.bind('<<ComboboxSelected>>', lambda e: self.save_current())
+                        self.ao_rows[s['texture']] = (cb, var); row += 1
                 self.restore_mesh(mesh)
             self.images = list_images(self.ws.get())
             ws, game = self.ws.get(), self.game.get()
@@ -543,11 +562,71 @@ def run_gui(selftest=False):
                 for tex, (cb, var, s) in self.tex_rows.items():
                     value = saved['textures'].get(tex, KEEP)
                     var.set(value if value in cb['values'] else KEEP)
+                for tex, (cb, var) in self.ao_rows.items():
+                    value = saved.get('ao', {}).get(tex, NO_AO)
+                    var.set(value if value in cb['values'] else NO_AO)
             else:
                 first = next((m for m in models if m != NO_MODEL), None)
                 self.c_model.set(first if mesh == self.c_default and first else NO_MODEL)
                 self.auto_textures()
             self.save_current()
+
+        def edit_materials(self):
+            """A small window with the current mesh's materials and their two sets of surface numbers."""
+            pkg, mesh = self.c_pkg.get(), self.cur_mesh
+            if not pkg or not mesh:
+                messagebox.showwarning(APP, 'Pick the base character and the mesh to replace first.'); return
+            ws, game = self.ws.get(), self.game.get()
+            self.run(lambda: job_material_settings(ws, game, pkg, mesh, self.log), lambda mats: self.material_window(mesh, mats))
+
+        def material_window(self, mesh, mats):
+            if not mats:
+                messagebox.showinfo(APP, 'This mesh has no materials with surface settings that can be changed here.'); return
+            saved = self.choices()['meshes'].setdefault(mesh, dict(model='', textures={}, ao={})).setdefault('materials', {})
+            win = tk.Toplevel(self); win.title('Material settings'); win.transient(self); win.grab_set()
+            ttk.Label(win, text='MKX has no roughness, shine or metalness textures. Each material has two sets of these numbers '
+                      '(0 to 1) and the Pmsk alpha picks between them per pixel: black = set 1, white = set 2, grey mixes them. '
+                      'Roughness: 0 = mirror-smooth, 1 = matte. Shine: strength of highlights. Metalness: 1 = metal. '
+                      'Subsurface: light glowing through (skin).', wraplength=860).grid(row=0, column=0, columnspan=10, sticky='w', padx=8, pady=6)
+            col = 1
+            for _, set_label in MATERIAL_SETS:
+                ttk.Label(win, text=set_label, font=('Segoe UI', 9, 'bold')).grid(row=1, column=col, columnspan=len(MATERIAL_SETTINGS), padx=6)
+                for _, label in MATERIAL_SETTINGS:
+                    ttk.Label(win, text=label).grid(row=2, column=col, padx=4); col += 1
+            entries = {}
+            for r, m in enumerate(mats, start=3):
+                ttk.Label(win, text='%s  (%s)' % (m['name'], m['base'])).grid(row=r, column=0, sticky='w', padx=8, pady=2)
+                col = 1
+                for k in MATERIAL_PARAMS:
+                    var = tk.StringVar(value=('%g' % saved.get(m['material'], {}).get(k, m['values'][k])) if k in m['values'] else '')
+                    ttk.Entry(win, textvariable=var, width=7, state='normal' if k in m['values'] else 'disabled').grid(row=r, column=col, padx=3, pady=2)
+                    entries[m['material'], k] = (var, m['values'].get(k)); col += 1
+
+            def save():
+                out = {}
+                for (path, k), (var, original) in entries.items():
+                    if original is None:
+                        continue
+                    try:
+                        v = float(var.get())
+                    except ValueError:
+                        messagebox.showerror(APP, 'Enter numbers between 0 and 1.', parent=win); return
+                    if not 0.0 <= v <= 1.0:
+                        messagebox.showerror(APP, 'Enter numbers between 0 and 1.', parent=win); return
+                    if abs(v - original) > 1e-4:
+                        out.setdefault(path, {})[k] = v
+                saved.clear(); saved.update(out)
+                self.save_current(); win.destroy()
+
+            def reset():
+                for (path, k), (var, original) in entries.items():
+                    if original is not None:
+                        var.set('%g' % original)
+            buttons = ttk.Frame(win); buttons.grid(row=len(mats) + 3, column=0, columnspan=10, sticky='w', padx=8, pady=8)
+            ttk.Button(buttons, text='Save', command=save).pack(side='left', padx=4)
+            ttk.Button(buttons, text='Back to the original numbers', command=reset).pack(side='left', padx=4)
+            ttk.Button(buttons, text='Cancel', command=win.destroy).pack(side='left', padx=4)
+            self.material_win = win
 
         def model_chosen(self):
             self.auto_textures()
@@ -597,6 +676,11 @@ def run_gui(selftest=False):
             for tex, (cb, var, s) in self.tex_rows.items():
                 if not only_unchosen or var.get() == KEEP:
                     var.set(choice.get(tex, KEEP))
+            ao = [im for im in getattr(self, 'images', []) if os.path.normcase(im).startswith(os.path.normcase(os.path.splitext(model)[0]) + os.sep)
+                  and re.search(r'(^|[^a-z])(ao|occlusion|ambientocclusion)([^a-z]|$)', os.path.basename(im).lower())]
+            for tex, (cb, var) in self.ao_rows.items():
+                if len(ao) == 1 and (not only_unchosen or var.get() == NO_AO):
+                    var.set(ao[0])
 
         # ---------------------------------------------------------------- actions
         def do_export(self):
@@ -651,8 +735,9 @@ def run_gui(selftest=False):
             self.save_current()
             st = self.choices()
             targets = set(self.c_paths.values())
-            parts = [dict(mesh=p, model=m['model'], textures=m['textures']) for p, m in st['meshes'].items()
-                     if m.get('model') and p in targets]
+            parts = [dict(mesh=p, model=m.get('model', ''), textures=m.get('textures', {}), ao=m.get('ao', {}),
+                          materials=m.get('materials', {})) for p, m in st['meshes'].items()
+                     if p in targets and (m.get('model') or m.get('textures') or m.get('ao') or m.get('materials'))]
             hide = [p for p, v in self.obj_vars.items() if not v.get()]
             if not parts and not hide:
                 messagebox.showwarning(APP, 'Link a .glb to at least one mesh: pick it in "Mesh to replace", then pick your .glb.\n'

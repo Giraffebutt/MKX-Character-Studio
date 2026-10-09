@@ -311,6 +311,10 @@ class ConvertHelperTests(unittest.TestCase):
         self.assertLess(int(px[0, 0, 0]), core.BRIGHT_LIMIT)
         dark = np.asarray(core.prepare_diffuse(Image.new('RGBA', (4, 4), (60, 50, 40, 120)), log=lambda m: None))
         self.assertEqual(tuple(dark[0, 0]), (60, 50, 40, 120))       # MKX-like textures stay untouched
+        ao = Image.new('L', (2, 2), 0); ao.putpixel((1, 0), 255); ao.putpixel((1, 1), 255)   # left dark, right open
+        withao = np.asarray(core.prepare_diffuse(Image.new('RGBA', (4, 4), (60, 50, 40, 120)), log=lambda m: None, ao=ao))
+        self.assertLess(int(withao[0, 0, 3]), 40); self.assertGreater(int(withao[0, 3, 3]), 215)  # AO becomes the alpha
+        self.assertEqual(tuple(withao[0, 0, :3]), (60, 50, 40))                                 # colours untouched
 
     def test_extra_object_packages_and_labels(self):
         with tempfile.TemporaryDirectory() as tmp:
