@@ -295,6 +295,7 @@ def _object_where(pkg):
 def object_label(path, packages):
     name = re.sub(r'(?i)_(sk|st)$', '', path.split('.')[-1])
     name = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', re.sub(r'^[A-Z]{2}_', '', name).replace('_', ' '))
+    name = name.replace('Master Female', 'Ferra')                 # Torr's partner keeps her internal name in the files
     where = sorted({_object_where(p) for p in packages}, key=lambda w: (w == 'select screen', w))
     return '%s  (%s)' % (name, ', '.join(where))
 
@@ -323,6 +324,11 @@ def mesh_homes(ws, game_dir, pkg_name, mesh, log=print):
     return homes
 
 
+# NPC meshes are left out of the extra objects, except a fighter's partner: Ferra rides with Torr (MasterMale) and is
+# stored as Characters.NPC.MasterFemale.* in his script-asset packages, with her blades, spikes and feathers.
+NPC_PARTNERS = ('.npc.masterfemale.',)
+
+
 def job_find_objects(ws, game_dir, pkg_name, mesh, log=print):
     """The character's extra objects (hats, weapons...): [{path, label, packages}]. `mesh` (the main mesh) is left out."""
     objects = {}
@@ -333,7 +339,8 @@ def job_find_objects(ws, game_dir, pkg_name, mesh, log=print):
             add(m, pkg_name)
     for name, path in sorted(object_packages(ws, game_dir, pkg_name).items()):
         for m in package_meshes(path):
-            if m.lower().startswith('characters.') and '.npc.' not in m.lower():
+            low = m.lower()
+            if low.startswith('characters.') and ('.npc.' not in low or any(n in low for n in NPC_PARTNERS)):
                 add(m, name)
     labels = {}
     for o in objects.values():
