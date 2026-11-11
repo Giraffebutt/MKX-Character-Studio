@@ -329,6 +329,8 @@ class ConvertHelperTests(unittest.TestCase):
         self.assertEqual(core.object_label('Characters.CHAR.Nomad.SharedProps.Meshes.NO_TraitHat_sk',
                                            ['UI_PS_NOMAD_SCRIPTASSETS.xxx', 'TRAIT_Nomad1_ScriptAssets.xxx']),
                          'Trait Hat  (variation 1, select screen)')
+        self.assertEqual(core.object_label('Characters.NPC.MasterFemale.NPC_MasterFemale_A.Meshes.MasterFemale_A',
+                                           ['Char_MasterMale_A_ScriptAssets.xxx']), 'Ferra A  (every variation)')
 
     def test_normals_are_checked_against_the_surface(self):
         import mkx_meshmod as mk
